@@ -3,12 +3,16 @@ from __future__ import annotations
 import json
 import math
 import random
+import subprocess
 import sys
 import time
+import asyncio
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 
-from PySide6.QtCore import QPoint, QTimer, Qt
+from PySide6.QtCore import QPoint, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -17,6 +21,24 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
     QWidget,
 )
+# TODO: ordered from easiest to most difficult:
+# 1. Detect whether the user is listening to music and start EVA's regular
+#    dance animation while music is playing. Beat synchronization is not needed.
+#    If a movie or YouTube video is playing, EVA should sit and eat popcorn.
+# 2. Add smoother transitions between the different images.
+# 3. Make EVA react to the time of day, such as being more active during the
+#    day and sleeping at night.
+# 4. Add food that EVA can eat.
+# 5. Add clothing and accessories for EVA, such as hats, glasses, and outfits.
+# 6. Make EVA react to user activity, such as being more active while the user
+#    is active and sleeping while the user is inactive.
+# 7. Add more animations for local weather conditions, such as rain, snow, and
+#    sunshine.
+# 8. Let EVA walk around the screen and interact with the user, such as
+#    following the mouse cursor or responding to clicks.
+# 9. Let EVA interact with other pets, such as playing together or fighting.
+# 10. Let EVA learn new behaviors and tricks over time, such as fetching
+#     objects or performing tricks.
 
 
 # ============================================================
@@ -80,6 +102,26 @@ STATE_BOB = {
         "amplitude": 1.5,
         "speed": 0.9,
     },
+
+    "dancing": {
+        "amplitude": 5.0,
+        "speed": 3.0,
+    }, 
+
+    "sleeping": {
+        "amplitude": 1.0,
+        "speed": 0.5,
+    },
+
+    "nervously": {
+        "amplitude": 3.0,
+        "speed": 2.5,
+    },
+
+    "hide": {
+        "amplitude": 1.0,
+        "speed": 0.5,
+    },
 }
 
 # ============================================================
@@ -111,6 +153,31 @@ SPRITES = {
         ASSET_DIR / "display_1.png",
         ASSET_DIR / "display_2.png",
     ],
+
+    "dancing": [
+        ASSET_DIR / "dancing_1.png",
+        ASSET_DIR / "dancing_2.png",
+    ],
+
+    "sleeping": [
+        ASSET_DIR / "sleeping_1.png",
+        ASSET_DIR / "sleeping_2.png",
+    ],
+
+    "nervously": [
+        ASSET_DIR / "nervously_1.png",
+        ASSET_DIR / "nervously_2.png",
+    ],
+
+    "hide": [
+        ASSET_DIR / "hide_1.png",
+        ASSET_DIR / "hide_2.png",
+    ],
+
+    "watching": [
+        ASSET_DIR / "watching_1.png",
+        ASSET_DIR / "watching_2.png",
+    ],
 }
 
 
@@ -120,6 +187,11 @@ STATE_LABELS = {
     "curious": "Neugierig",
     "sad": "Traurig",
     "display": "Zum Display schauen",
+    "dancing": "Tanzen",
+    "sleeping": "Schlafen",
+    "nervously": "Nervös",
+    "hide": "Verstecken",
+    "watching": "Video schauen",
 }
 
 
@@ -208,7 +280,70 @@ class Settings:
 # EVA Desktop Pet
 # ============================================================
 
+MEDIA_SERVER_HOST = "127.0.0.1"
+MEDIA_SERVER_PORT = 8765
+
+
+class EvaMediaRequestHandler(BaseHTTPRequestHandler):
+
+    def _send_status(self, status: int):
+        self.send_response(status)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.end_headers()
+
+    def do_OPTIONS(self):
+        self._send_status(204)
+
+    def do_POST(self):
+        if self.path != "/media-state":
+            self._send_status(404)
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+
+            if content_length < 1 or content_length > 1024:
+                raise ValueError("Ungültige Nachrichtengröße")
+
+            payload = json.loads(
+                self.rfile.read(content_length).decode("utf-8")
+            )
+
+            playing = payload.get("video_playing")
+
+            if not isinstance(playing, bool):
+                raise ValueError("video_playing muss true oder false sein")
+
+            self.server.state_callback(playing)
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self._send_status(400)
+            return
+
+        self._send_status(204)
+
+    def log_message(self, format, *args):
+        return
+
+
+class EvaMediaServer(ThreadingHTTPServer):
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, state_callback):
+        super().__init__(
+            (MEDIA_SERVER_HOST, MEDIA_SERVER_PORT),
+            EvaMediaRequestHandler,
+        )
+        self.state_callback = state_callback
+
 class EvaPet(QWidget):
+
+    music_state_ready = Signal(str)
+    music_check_failed = Signal(str)
+    video_state_ready = Signal(bool)
 
     def __init__(self):
 
@@ -288,6 +423,24 @@ class EvaPet(QWidget):
         self._restore_position()
 
         self._setup_timers()
+
+        self._music_check_running = False
+        self._music_playing = False
+        self._video_playing = False
+        self._media_reaction_active = False
+        self._media_server = None
+
+        self.music_state_ready.connect(self._apply_music_state)
+        self.music_check_failed.connect(self._disable_music_detection)
+        self.video_state_ready.connect(self._apply_video_state)
+
+        self._start_media_server()
+
+        self.music_timer = QTimer(self)
+
+        self.music_timer.timeout.connect(self._start_apple_music_check)
+
+        self.music_timer.start(2000)
 
         self._setup_tray()
 
@@ -866,12 +1019,23 @@ class EvaPet(QWidget):
                     "curious",
                     "display",
                     "happy",
+                    "dancing",
+                    "sleeping",
+                    "nervously",
+                    "hide",
+                    "watching",
                 ],
 
                 weights=[
                     45,
                     30,
                     25,
+                    15,
+                    10,
+                    10,
+                    5,
+                    20,
+                    
                 ],
 
                 k=1,
@@ -896,6 +1060,31 @@ class EvaPet(QWidget):
                     random.uniform(
                         2.5,
                         4.5,
+                    ),
+                "dancing":
+                    random.uniform(
+                        3.0,
+                        6.0,
+                    ),
+                "sleeping":
+                    random.uniform(
+                        10.0,
+                        15.0,
+                    ),
+                "nervously":
+                    random.uniform(
+                        2.0,
+                        5.0,
+                    ),
+                "hide":
+                    random.uniform(
+                        1.0,
+                        3.0,
+                    ),
+                "watching":
+                    random.uniform(
+                        5.0,
+                        10.0,
                     ),
             }
 
@@ -1006,6 +1195,10 @@ class EvaPet(QWidget):
             "curious",
             "sad",
             "display",
+            "dancing",
+            "sleeping",
+            "nervously",
+            "hide",
         ):
 
             action = QAction(
@@ -1548,8 +1741,140 @@ class EvaPet(QWidget):
 
             self.tray.hide()
 
+        if self._media_server is not None:
+            self._media_server.shutdown()
+            self._media_server.server_close()
+
         event.accept()
 
+    def _start_media_server(self):
+        try:
+            self._media_server = EvaMediaServer(
+                self.video_state_ready.emit
+            )
+        except OSError as error:
+            if sys.stdout is not None:
+                print(f"Video-Erkennung nicht gestartet: {error}")
+            return
+
+        Thread(
+            target=self._media_server.serve_forever,
+            daemon=True,
+        ).start()
+
+    def _start_apple_music_check(self):
+        if self._music_check_running:
+            return
+
+        self._music_check_running = True
+
+        Thread(
+            target=self._check_apple_music,
+            daemon=True,
+        ).start()
+
+    def _check_apple_music(self):
+        try:
+            creation_flags = getattr(
+                subprocess,
+                "CREATE_NO_WINDOW",
+                0,
+            )
+
+            python_executable = Path(sys.executable)
+
+            if python_executable.name.lower() == "pythonw.exe":
+                python_executable = python_executable.with_name("python.exe")
+
+            result = subprocess.run(
+                [
+                    str(python_executable),
+                    str(Path(__file__).resolve()),
+                    "--check-apple-music",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=creation_flags,
+            )
+
+            if result.returncode != 0:
+                message = result.stderr.strip() or "Unbekannter Medienfehler"
+                self.music_check_failed.emit(message)
+                return
+
+            state = result.stdout.strip()
+
+            if state not in {"idle", "dancing"}:
+                self.music_check_failed.emit(
+                    f"Ungültiger Musikstatus: {state!r}"
+                )
+                return
+        except Exception as error:
+            self.music_check_failed.emit(str(error))
+        else:
+            self.music_state_ready.emit(state)
+        finally:
+            self._music_check_running = False
+
+    def _apply_music_state(self, state: str):
+        self._music_playing = state == "dancing"
+        self._update_media_reaction()
+
+    def _apply_video_state(self, playing: bool):
+        self._video_playing = playing
+        self._update_media_reaction()
+
+    def _update_media_reaction(self):
+        if self._music_playing:
+            target_state = "dancing"
+        elif self._video_playing:
+            # Bis Popcorn-Sprites vorhanden sind, nutzt EVA "display".
+            target_state = "watching"
+        else:
+            if self._media_reaction_active:
+                self._media_reaction_active = False
+                self.set_state("idle", manual=False)
+            return
+
+        self._media_reaction_active = True
+
+        if self.current_state == target_state:
+            self.manual_state = True
+            self.temporary_until = 0.0
+            return
+
+        self.set_state(target_state, manual=True)
+
+    def _disable_music_detection(self, message: str):
+        self.music_timer.stop()
+
+        if sys.stdout is not None:
+            print(f"Apple-Music-Erkennung deaktiviert: {message}")
+
+
+async def get_apple_music_state() -> str:
+    from winrt.windows.media.control import (
+        GlobalSystemMediaTransportControlsSessionManager,
+    )
+
+    manager = await (
+        GlobalSystemMediaTransportControlsSessionManager.request_async()
+    )
+
+    for session in manager.get_sessions():
+        app_id = session.source_app_user_model_id.lower()
+
+        if "applemusic" not in app_id:
+            continue
+
+        playback_info = session.get_playback_info()
+        status_code = playback_info.playback_status
+
+        # 4 bedeutet „Playing“
+        return "dancing" if status_code == 4 else "idle"
+
+    return "idle"
 
 # ============================================================
 # Main
@@ -1580,6 +1905,15 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--check-apple-music" in sys.argv:
+        try:
+            detected_state = asyncio.run(get_apple_music_state())
+        except Exception as error:
+            print(str(error), file=sys.stderr)
+            raise SystemExit(1)
+
+        print(detected_state)
+        raise SystemExit(0)
 
     raise SystemExit(
         main()
