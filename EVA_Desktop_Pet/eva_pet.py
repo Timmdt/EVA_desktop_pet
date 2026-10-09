@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 from sprite_animation import aligned_grid_frames, intermediate_frames
 from motion_stabilization import stabilize_frames
 from animation_clock import frame_index_at
+from expanded_sprites import fixed_grid_frames, load_expanded_sheets
 #BUG: allways on top didnt work corretly
 
 # TODO: ordered from easiest to most difficult:
@@ -535,7 +536,14 @@ class EvaPet(QWidget):
 
     def _load_all_sprites(self):
 
+        expanded_sheets = load_expanded_sheets(ASSET_DIR)
+        self._expanded_states = set()
+
         for state, sheets in SPRITES.items():
+
+            if state in expanded_sheets:
+                sheets = [expanded_sheets[state]]
+                self._expanded_states.add(state)
 
             original_frames: list[Image.Image] = []
 
@@ -550,6 +558,10 @@ class EvaPet(QWidget):
 
                 with Image.open(sheet_path) as source:
                     sheet = source.convert("RGBA")
+
+                if state in self._expanded_states:
+                    original_frames.extend(fixed_grid_frames(sheet))
+                    continue
 
                 if state == "dancing":
                     original_frames.extend(
@@ -604,7 +616,9 @@ class EvaPet(QWidget):
                         frame
                     )
 
-            if state in STABILIZE_STATES:
+            # The 4x4 sheets are already on a fixed canvas. Avoid moving
+            # the whole character to compensate for blinking/hand changes.
+            if state in STABILIZE_STATES and state not in self._expanded_states:
                 original_frames = stabilize_frames(original_frames)
 
             intermediate_count = STATE_INTERMEDIATES.get(state, INTERMEDIATE_FRAMES)
@@ -617,7 +631,8 @@ class EvaPet(QWidget):
                 blink_poses = BLINK_POSES.get(state, set())
                 eye_regions = None
                 open_eye_source = None
-                if index in blink_poses or next_index in blink_poses:
+                if (state not in self._expanded_states
+                        and (index in blink_poses or next_index in blink_poses)):
                     eye_regions = (EYE_REGIONS[state][index], EYE_REGIONS[state][next_index])
                     open_eye_source = 1 if index in blink_poses else 0
 
@@ -785,7 +800,8 @@ class EvaPet(QWidget):
         new_frame = frame_index_at(
             time.perf_counter() - self._animation_epoch,
             frame_count,
-            STATE_FPS.get(self.current_state, 5),
+            STATE_FPS.get(self.current_state, 5)
+            * (2 if self.current_state in self._expanded_states else 1),
             intermediate_count,
             ANIMATION_SPEED,
         )
