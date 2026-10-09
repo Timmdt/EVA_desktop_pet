@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from sprite_animation import aligned_grid_frames, intermediate_frames
+from motion_stabilization import stabilize_frames
+from animation_clock import frame_index_at
 #BUG: allways on top didnt work corretly
 
 # TODO: ordered from easiest to most difficult:
@@ -58,6 +60,22 @@ COMMAND_FILE = APP_DIR / "pet_command.json"
 
 FRAMES_PER_SHEET = 4
 INTERMEDIATE_FRAMES = 3
+# Use more movement samples only where a slowly animated character needs them.
+# Eight original poses remain eight original poses: in-betweens do NOT accelerate the animation.
+STATE_INTERMEDIATES = {
+    "idle": 7,
+    "happy": 5,
+    "curious": 5,
+    "sad": 5,
+    "dancing": 7,
+    "sleeping": 5,
+    "nervously": 5,
+    "hide": 7,
+}
+# Keep deliberate sideways moves in display/watching; stabilize small frame jitter elsewhere.
+STABILIZE_STATES = {
+    "idle", "happy", "curious", "sad", "dancing", "sleeping", "nervously", "hide",
+}
 # Original-pose cadence; in-betweens increase rendering FPS, not motion speed.
 ANIMATION_SPEED = 0.65
 
@@ -393,6 +411,11 @@ class EvaPet(QWidget):
             list[QPixmap]
         ] = {}
 
+        # Cache scaled pixmaps for the selected window size; avoid resizing on every tick.
+        self._scaled_frames: dict[str, list[QPixmap]] = {}
+        self._animation_epoch = time.perf_counter()
+        self._bob_offset = 0
+
         # ----------------------------------------------------
         # Smooth motion
         # ----------------------------------------------------
@@ -581,6 +604,10 @@ class EvaPet(QWidget):
                         frame
                     )
 
+            if state in STABILIZE_STATES:
+                original_frames = stabilize_frames(original_frames)
+
+            intermediate_count = STATE_INTERMEDIATES.get(state, INTERMEDIATE_FRAMES)
             state_frames: list[QPixmap] = []
 
             for index, current_frame in enumerate(original_frames):
@@ -601,7 +628,7 @@ class EvaPet(QWidget):
                 for intermediate in intermediate_frames(
                     current_frame,
                     next_frame,
-                    INTERMEDIATE_FRAMES,
+                    intermediate_count,
                     eye_regions=eye_regions,
                     open_eye_source=open_eye_source,
                 ):
@@ -634,12 +661,26 @@ class EvaPet(QWidget):
             QImage.Format.Format_RGBA8888,
         ).copy()
 
-        return QPixmap.fromImage(qimage)
+        pixmap = QPixmap.fromImage(qimage)
+        # Maximum visible size is MAX_WIDTH. Avoid keeping ~1 GB of oversize
+        # pixmaps after increasing the number of generated in-betweens.
+        if pixmap.width() > MAX_WIDTH:
+            pixmap = pixmap.scaledToWidth(
+                MAX_WIDTH, Qt.TransformationMode.FastTransformation
+            )
+        return pixmap
 
 
     # ========================================================
     # Scaling
     # ========================================================
+
+    def _scaled_state_frames(self, state: str) -> list[QPixmap]:
+        cached = self._scaled_frames.get(state)
+        if cached is None:
+            cached = [self._scaled_frame(frame) for frame in self.frames[state]]
+            self._scaled_frames[state] = cached
+        return cached
 
     def _scaled_frame(
         self,
@@ -668,11 +709,8 @@ class EvaPet(QWidget):
             ),
         )
 
-        sample = self._scaled_frame(
-            self.frames[
-                self.current_state
-            ][0]
-        )
+        self._scaled_frames.clear()
+        sample = self._scaled_state_frames(self.current_state)[0]
 
         window_width = (
             sample.width()
@@ -704,17 +742,8 @@ class EvaPet(QWidget):
 
     def _show_frame(self):
 
-        frames = self.frames[
-            self.current_state
-        ]
-
-        pixmap = self._scaled_frame(
-            frames[
-                self.current_frame
-                %
-                len(frames)
-            ]
-        )
+        frames = self._scaled_state_frames(self.current_state)
+        pixmap = frames[self.current_frame % len(frames)]
 
         self.label.setPixmap(
             pixmap
@@ -731,19 +760,15 @@ class EvaPet(QWidget):
             pixmap.width()
         ) // 2
 
-        self.label.move(
-            x,
-            BOB_MARGIN,
-        )
+        # Preserve the current hover offset instead of resetting it at each
+        # sprite change. This used to create a visible vertical jump.
+        self.label.move(x, BOB_MARGIN + self._bob_offset)
 
-        if hasattr(
-            self,
-            "tray",
-        ):
-
-            self.tray.setIcon(
-                QIcon(pixmap)
-            )
+    def _refresh_tray_icon(self):
+        # A QSystemTrayIcon update for every sprite frame is unnecessarily
+        # expensive on Windows; update only when the emotion/size changes.
+        if hasattr(self, "tray"):
+            self.tray.setIcon(QIcon(self._scaled_state_frames(self.current_state)[0]))
 
 
     # ========================================================
@@ -751,18 +776,23 @@ class EvaPet(QWidget):
     # ========================================================
 
     def _next_frame(self):
-
-        frame_count = len(
-            self.frames[
-                self.current_state
-            ]
+        # Derive the pose from elapsed time, not from the number of QTimer calls.
+        # Skipped Qt ticks cannot make the animation run permanently behind.
+        frame_count = len(self.frames[self.current_state])
+        intermediate_count = STATE_INTERMEDIATES.get(
+            self.current_state, INTERMEDIATE_FRAMES
         )
-
-        self.current_frame = (
-            self.current_frame + 1
-        ) % frame_count
-
-        self._show_frame()
+        new_frame = frame_index_at(
+            time.perf_counter() - self._animation_epoch,
+            frame_count,
+            STATE_FPS.get(self.current_state, 5),
+            intermediate_count,
+            ANIMATION_SPEED,
+        )
+        if new_frame != self.current_frame:
+            self.current_frame = new_frame
+            self._show_frame()
+        self._update_motion()
 
 
     # ========================================================
@@ -789,6 +819,7 @@ class EvaPet(QWidget):
             elapsed * speed
         ) * amplitude
 
+        self._bob_offset = round(offset)
         pixmap = self.label.pixmap()
 
         if pixmap is None:
@@ -803,7 +834,7 @@ class EvaPet(QWidget):
         y = (
             BOB_MARGIN
             +
-            int(offset)
+            self._bob_offset
         )
 
         self.label.move(
@@ -897,19 +928,9 @@ class EvaPet(QWidget):
         self.settings.save()
 
     def _update_animation_speed(self):
-
-        fps = STATE_FPS.get(
-            self.current_state,
-            5,
-        ) * (INTERMEDIATE_FRAMES + 1) * ANIMATION_SPEED
-
-        interval = round(
-            1000 / fps
-        )
-
-        self.animation_timer.setInterval(
-            interval
-        )
+        # Called when the state changes. Rendering stays at 60 Hz regardless
+        # of the chosen sprite playback speed.
+        self._animation_epoch = time.perf_counter()
 
 
     # ========================================================
@@ -930,28 +951,9 @@ class EvaPet(QWidget):
             self._next_frame
         )
 
+        self.animation_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._update_animation_speed()
-        self.animation_timer.start()
-
-        # --------------------------------------------
-        # Smooth movement
-        # --------------------------------------------
-
-        self.motion_timer = QTimer(
-            self
-        )
-
-        self.motion_timer.timeout.connect(
-            self._update_motion
-        )
-
-        self.motion_timer.start(
-            int(
-                1000
-                /
-                MOTION_FPS
-            )
-        )
+        self.animation_timer.start(round(1000 / MOTION_FPS))
 
         # --------------------------------------------
         # Random behavior
@@ -1043,6 +1045,7 @@ class EvaPet(QWidget):
             self.temporary_until = 0.0
 
         self._show_frame()
+        self._refresh_tray_icon()
 
 
     # ========================================================
