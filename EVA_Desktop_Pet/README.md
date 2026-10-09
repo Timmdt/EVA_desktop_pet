@@ -87,6 +87,29 @@ Entfernen:
 
 Alle Sprite-Sheets bestehen aus vier Frames nebeneinander.
 
+Pro Zustand werden zwei Sheets zu acht Originalbildern verbunden. Für Tanzen
+wird stattdessen das neue `assets/dancing_v2.png` mit einem 4×2-Raster verwendet;
+die acht Posen werden auf dieselbe Größe und Grundlinie ausgerichtet. Beim Start
+werden mit OpenCV drei bewegungsbasierte Zwischenbilder je Übergang erzeugt,
+auch vom letzten Bild zurück zum ersten (32 Frames pro Zustand). Die Pixel
+werden verschoben statt zwei Posen zu überblenden; Farben und Transparenz
+bleiben erhalten. Bei stark unterschiedlichen Posen können sich Details am
+Wechsel zwischen den beiden Ausgangsbildern noch sichtbar ändern.
+
+In `eva_pet.py` steuert `INTERMEDIATE_FRAMES` die Zahl der Zwischenbilder und
+`ANIMATION_SPEED` das Tempo. Der Standardwert `0.65` verlangsamt Sprite-Animation
+und Schweben um 35 Prozent. Mehr Zwischenbilder erhöhen die Bildrate, nicht das
+Bewegungstempo. Die Berechnung aller Zustände kann beim Start einige Sekunden
+dauern. Nach einem Update installiert `install.bat` die benötigten Pakete.
+
+Idle und Verstecken behandeln ihre kurzen Blinzelposen getrennt von der
+Körperbewegung: Die Zwischenbilder behalten offene Augen, das geschlossene
+Originalbild erscheint nur für einen Bildschritt (standardmäßig etwa 77 ms).
+Nur die Augenbereiche werden ersetzt; Körpertempo, Mund und Schweben behalten
+ihren langsamen Ablauf. Die Tanzposen haben durchgehend offene Augen und
+zusammenpassende Armbewegungen, damit beim Interpolieren keine unterschiedlichen
+Gesichtsausdrücke ineinander verzogen werden.
+
 ## Späterer EVA-Agent
 
 Später kann EVA z.B. automatisch:

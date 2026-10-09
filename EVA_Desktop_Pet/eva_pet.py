@@ -13,7 +13,8 @@ from pathlib import Path
 from threading import Thread
 
 from PySide6.QtCore import QPoint, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QIcon, QPixmap
+from PIL import Image
+from PySide6.QtGui import QAction, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QLabel,
@@ -21,11 +22,10 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
     QWidget,
 )
+from sprite_animation import aligned_grid_frames, intermediate_frames
+#BUG: allways on top didnt work corretly
+
 # TODO: ordered from easiest to most difficult:
-# 1. Detect whether the user is listening to music and start EVA's regular
-#    dance animation while music is playing. Beat synchronization is not needed.
-#    If a movie or YouTube video is playing, EVA should sit and eat popcorn.
-# 2. Add smoother transitions between the different images.
 # 3. Make EVA react to the time of day, such as being more active during the
 #    day and sleeping at night.
 # 4. Add food that EVA can eat.
@@ -57,6 +57,36 @@ COMMAND_FILE = APP_DIR / "pet_command.json"
 # ============================================================
 
 FRAMES_PER_SHEET = 4
+INTERMEDIATE_FRAMES = 3
+# Original-pose cadence; in-betweens increase rendering FPS, not motion speed.
+ANIMATION_SPEED = 0.65
+
+# Only these original poses are short blinks, not sustained expressions.
+BLINK_POSES = {"idle": {2, 6}, "hide": {1, 5}}
+# Eye-only patches in the original 543 x 724 frames. Keep the mouth,
+# visor highlight, ears and hands outside the patches.
+EYE_REGIONS = {
+    "idle": [
+        ((192, 354, 296, 466), (357, 402, 444, 500)),
+        ((187, 331, 286, 445), (347, 390, 439, 480)),
+        ((189, 345, 291, 450), (348, 392, 442, 490)),
+        ((189, 339, 288, 451), (348, 391, 443, 500)),
+        ((189, 346, 305, 475), (357, 410, 454, 513)),
+        ((183, 322, 302, 439), (354, 386, 455, 498)),
+        ((181, 345, 303, 457), (356, 403, 455, 501)),
+        ((206, 351, 313, 468), (365, 416, 464, 520)),
+    ],
+    "hide": [
+        ((196, 428, 302, 526), (346, 450, 437, 541)),
+        ((189, 430, 292, 518), (349, 454, 441, 539)),
+        ((190, 425, 299, 529), (336, 432, 433, 531)),
+        ((188, 485, 300, 560), (340, 496, 435, 560)),
+        ((195, 468, 302, 559), (345, 475, 442, 560)),
+        ((209, 473, 310, 557), (366, 490, 463, 560)),
+        ((203, 468, 310, 561), (356, 475, 453, 561)),
+        ((212, 535, 312, 595), (362, 540, 456, 595)),
+    ],
+}
 
 # Sprite animation:
 # Gesicht / Ohren / Ausdruck
@@ -155,8 +185,7 @@ SPRITES = {
     ],
 
     "dancing": [
-        ASSET_DIR / "dancing_1.png",
-        ASSET_DIR / "dancing_2.png",
+        ASSET_DIR / "dancing_v2.png",
     ],
 
     "sleeping": [
@@ -485,7 +514,7 @@ class EvaPet(QWidget):
 
         for state, sheets in SPRITES.items():
 
-            state_frames = []
+            original_frames: list[Image.Image] = []
 
             for sheet_path in sheets:
 
@@ -496,16 +525,14 @@ class EvaPet(QWidget):
                         f"{sheet_path}\n"
                     )
 
-                sheet = QPixmap(
-                    str(sheet_path)
-                )
+                with Image.open(sheet_path) as source:
+                    sheet = source.convert("RGBA")
 
-                if sheet.isNull():
-
-                    raise RuntimeError(
-                        f"Sprite konnte nicht geladen werden:\n"
-                        f"{sheet_path}"
+                if state == "dancing":
+                    original_frames.extend(
+                        aligned_grid_frames(sheet, 4, 2, (543, 724))
                     )
+                    continue
 
                 # --------------------------------------------
                 # Sicherheit:
@@ -513,7 +540,7 @@ class EvaPet(QWidget):
                 # --------------------------------------------
 
                 if (
-                    sheet.width()
+                    sheet.width
                     % FRAMES_PER_SHEET
                     != 0
                 ):
@@ -521,35 +548,66 @@ class EvaPet(QWidget):
                     raise RuntimeError(
                         f"\nUngültiges Sprite-Sheet:\n"
                         f"{sheet_path}\n\n"
-                        f"Breite: {sheet.width()} px\n"
+                        f"Breite: {sheet.width} px\n"
                         f"Die Breite muss durch "
                         f"{FRAMES_PER_SHEET} "
                         f"teilbar sein.\n"
                     )
 
                 frame_width = (
-                    sheet.width()
+                    sheet.width
                     //
                     FRAMES_PER_SHEET
                 )
 
                 frame_height = (
-                    sheet.height()
+                    sheet.height
                 )
 
                 for i in range(
                     FRAMES_PER_SHEET
                 ):
 
-                    frame = sheet.copy(
-                        i * frame_width,
-                        0,
-                        frame_width,
-                        frame_height,
+                    frame = sheet.crop(
+                        (
+                            i * frame_width,
+                            0,
+                            (i + 1) * frame_width,
+                            frame_height,
+                        )
                     )
 
-                    state_frames.append(
+                    original_frames.append(
                         frame
+                    )
+
+            state_frames: list[QPixmap] = []
+
+            for index, current_frame in enumerate(original_frames):
+
+                next_index = (index + 1) % len(original_frames)
+                next_frame = original_frames[next_index]
+                blink_poses = BLINK_POSES.get(state, set())
+                eye_regions = None
+                open_eye_source = None
+                if index in blink_poses or next_index in blink_poses:
+                    eye_regions = (EYE_REGIONS[state][index], EYE_REGIONS[state][next_index])
+                    open_eye_source = 1 if index in blink_poses else 0
+
+                state_frames.append(
+                    self._pil_image_to_pixmap(current_frame)
+                )
+
+                for intermediate in intermediate_frames(
+                    current_frame,
+                    next_frame,
+                    INTERMEDIATE_FRAMES,
+                    eye_regions=eye_regions,
+                    open_eye_source=open_eye_source,
+                ):
+
+                    state_frames.append(
+                        self._pil_image_to_pixmap(intermediate)
                     )
 
             self.frames[state] = (
@@ -561,6 +619,22 @@ class EvaPet(QWidget):
                 f"{state}: "
                 f"{len(state_frames)} Frames geladen"
             )
+
+    @staticmethod
+    def _pil_image_to_pixmap(image: Image.Image) -> QPixmap:
+
+        rgba_image = image.convert("RGBA")
+        image_data = rgba_image.tobytes("raw", "RGBA")
+
+        qimage = QImage(
+            image_data,
+            rgba_image.width,
+            rgba_image.height,
+            rgba_image.width * 4,
+            QImage.Format.Format_RGBA8888,
+        ).copy()
+
+        return QPixmap.fromImage(qimage)
 
 
     # ========================================================
@@ -709,7 +783,7 @@ class EvaPet(QWidget):
         )
 
         amplitude = bob["amplitude"]
-        speed = bob["speed"]
+        speed = bob["speed"] * ANIMATION_SPEED
 
         offset = math.sin(
             elapsed * speed
@@ -827,9 +901,9 @@ class EvaPet(QWidget):
         fps = STATE_FPS.get(
             self.current_state,
             5,
-        )
+        ) * (INTERMEDIATE_FRAMES + 1) * ANIMATION_SPEED
 
-        interval = int(
+        interval = round(
             1000 / fps
         )
 
