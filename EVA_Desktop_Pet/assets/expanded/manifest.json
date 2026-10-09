@@ -1,0 +1,18 @@
+{
+  "format": "eva-4x4-v1",
+  "columns": 4,
+  "rows": 4,
+  "states": {
+    "idle": "idle_blink.png",
+    "happy": "happy.png",
+    "curious": "curious.png",
+    "sad": "sad.png",
+    "display": "display.png",
+    "dancing": "dancing.png",
+    "sleeping": "sleeping_bed.png",
+    "nervously": "nervously.png",
+    "hide": "hide.png",
+    "watching": "watching.png",
+    "shy": "shy.png"
+  }
+}
