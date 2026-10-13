@@ -1,99 +1,95 @@
+from __future__ import annotations
+
 import argparse
+import math
 from pathlib import Path
+
 from PIL import Image, ImageChops
+
 
 APP_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = APP_DIR / "assets"
-
-STATE_FILE = APP_DIR / "state.json"
-
-framesPerSheet = 32
-
-
-def _active_ranges(occupied: list[bool]) -> list[tuple[int, int]]:
-    ranges = []
-    start = None
-
-    for index, is_occupied in enumerate(occupied):
-        if is_occupied and start is None:
-            start = index
-        elif not is_occupied and start is not None:
-            ranges.append((start, index))
-            start = None
-
-    if start is not None:
-        ranges.append((start, len(occupied)))
-
-    return ranges
+FRAMES_PER_SHEET = 32
+SHEET_COLUMNS = 8
+SHEET_ROWS = 4
+FRAME_LAYOUT_VERSION = "centered-v1"
+VERSION_FILE_NAME = ".layout-version"
 
 
-def extract_spritesheet(input_path: Path, output_dir: Path) -> list[Path]:
-    image = Image.open(input_path).convert("RGBA")
+def _remove_magenta_background(image: Image.Image) -> Image.Image:
+    image = image.convert("RGBA")
     hue, saturation, _ = image.convert("HSV").split()
-    background = ImageChops.multiply(
+    magenta = ImageChops.multiply(
         hue.point(lambda value: 255 if 190 <= value <= 245 else 0),
         saturation.point(lambda value: 255 if value >= 70 else 0),
     )
-    foreground = ImageChops.multiply(
-        ImageChops.invert(background),
-        image.getchannel("A"),
-    )
-    pixels = foreground.load()
+    original_alpha = image.getchannel("A")
+    foreground_alpha = ImageChops.multiply(ImageChops.invert(magenta), original_alpha)
+    image.putalpha(foreground_alpha)
+    return image
+
+
+def extract_spritesheet(input_path: Path, output_dir: Path) -> list[Path]:
+    """Teilt das Sprite-Sheet und zentriert jedes Motiv in einer festen Box."""
+    image = _remove_magenta_background(Image.open(input_path))
     width, height = image.size
-    row_ranges = _active_ranges(
-        [any(pixels[x, y] for x in range(width)) for y in range(height)]
-    )
+    frame_width = math.ceil(width / SHEET_COLUMNS)
+    frame_height = math.ceil(height / SHEET_ROWS)
 
-    frame_boxes = []
-    for top, bottom in row_ranges:
-        column_ranges = _active_ranges(
-            [any(pixels[x, y] for y in range(top, bottom)) for x in range(width)]
-        )
-        for left, right in column_ranges:
-            bounds = foreground.crop((left, top, right, bottom)).getbbox()
-            if bounds is not None:
-                frame_boxes.append(
-                    (
-                        left + bounds[0],
-                        top + bounds[1],
-                        left + bounds[2],
-                        top + bounds[3],
-                    )
-                )
-
-    if len(frame_boxes) != framesPerSheet:
-        raise ValueError(
-            f"Es wurden {len(frame_boxes)} Bilder erkannt; "
-            f"erwartet werden {framesPerSheet}."
-        )
-
-    image.putalpha(foreground)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_paths = []
-    for index, bounds in enumerate(frame_boxes, start=1):
+    centered_frames: list[Image.Image] = []
+    output_paths: list[Path] = []
+
+    for row in range(SHEET_ROWS):
+        for column in range(SHEET_COLUMNS):
+            left = round(column * width / SHEET_COLUMNS)
+            right = round((column + 1) * width / SHEET_COLUMNS)
+            top = round(row * height / SHEET_ROWS)
+            bottom = round((row + 1) * height / SHEET_ROWS)
+
+            frame = image.crop((left, top, right, bottom))
+            visible_bounds = frame.getchannel("A").getbbox()
+            if visible_bounds is None:
+                raise ValueError(f"Frame in Reihe {row + 1}, Spalte {column + 1} ist leer.")
+
+            # Nur das sichtbare Pet verwenden. Die transparente Zielbox bleibt
+            # fuer alle Frames gleich gross, das Pet sitzt immer in ihrer Mitte.
+            pet = frame.crop(visible_bounds)
+            canvas = Image.new("RGBA", (frame_width, frame_height), (0, 0, 0, 0))
+            x = (frame_width - pet.width) // 2
+            y = (frame_height - pet.height) // 2
+            # Die Alpha-Maske verhindert, dass unsichtbare Magenta-RGB-Werte
+            # beim Skalieren als farbiger Rand durchscheinen.
+            canvas.paste(pet, (x, y), pet)
+            centered_frames.append(canvas)
+
+    for index, canvas in enumerate(centered_frames, start=1):
         output_path = output_dir / f"{input_path.stem}_{index:02}.png"
-        image.crop(bounds).save(output_path)
+        canvas.save(output_path)
         output_paths.append(output_path)
 
+    if len(output_paths) != FRAMES_PER_SHEET:
+        raise RuntimeError(
+            f"Es wurden {len(output_paths)} Frames erzeugt; erwartet werden {FRAMES_PER_SHEET}."
+        )
+    (output_dir / VERSION_FILE_NAME).write_text(FRAME_LAYOUT_VERSION, encoding="utf-8")
     return output_paths
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Entfernt den magentafarbenen Hintergrund und "
-        "schneidet ein Sprite-Sheet in einzelne PNG-Bilder."
+        description="Entfernt den magentafarbenen Hintergrund und teilt Sprite-Sheets in Frames."
     )
     parser.add_argument(
         "--input",
         type=Path,
-        help="Optionaler Pfad zu einem Sprite-Sheet; standardmäßig werden "
-        "alle PNG-Dateien aus assets/models verarbeitet.",
+        help="Optionaler Pfad; standardmaessig werden alle PNGs aus assets/models verarbeitet.",
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=ASSETS_DIR / "frames",
-        help="Zielordner für die transparenten PNGs (Standard: assets/frames)",
+        help="Zielordner fuer die transparenten PNGs (Standard: assets/frames)",
     )
     args = parser.parse_args()
 
@@ -103,10 +99,7 @@ def main() -> None:
 
     for input_path in input_paths:
         output_paths = extract_spritesheet(input_path, args.output)
-        print(
-            f"{len(output_paths)} transparente Bilder aus {input_path.name} "
-            f"gespeichert in: {args.output}"
-        )
+        print(f"{len(output_paths)} Frames aus {input_path.name} gespeichert in: {args.output}")
 
 
 if __name__ == "__main__":
